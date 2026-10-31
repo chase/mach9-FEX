@@ -896,6 +896,8 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   // A restart can move the host code, so the offsets of a previous attempt are stale.
   DebugData->Subblocks.clear();
   DebugData->GuestOpcodes.clear();
+  // A restart inside a block with X87PC ops skips the reset at the end of that block.
+  X87PCCopyStart = nullptr;
 
   // Fairly excessive buffer range to make sure we don't overflow
   // One page baseline, plus SSANodeMultipler bytes, plus another page for guard page.
