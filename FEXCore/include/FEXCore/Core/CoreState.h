@@ -188,6 +188,7 @@ struct alignas(64) CPUState {
     GDT->Limit1 = Limit >> 16;
   }
 
+  // As loaded. Anything the guest can see goes through FPState::ReconstructFCW.
   uint16_t FCW {0x37F};
   uint8_t AbridgedFTW {};
 

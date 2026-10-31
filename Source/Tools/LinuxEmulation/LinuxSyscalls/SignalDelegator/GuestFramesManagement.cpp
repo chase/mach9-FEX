@@ -486,7 +486,7 @@ uint64_t SignalDelegator::SetupFrame_x64(FEXCore::Core::InternalThreadState* Thr
   fpstate->mxcsr_mask = 0xFFC0;
 
   // FCW store default
-  fpstate->fcw = Frame->State.FCW;
+  fpstate->fcw = FEXCore::FPState::ReconstructFCW(Frame->State.FCW);
   fpstate->ftw = Frame->State.AbridgedFTW;
 
   // Reconstruct FSW
@@ -611,7 +611,7 @@ uint64_t SignalDelegator::SetupFrame_ia32(FEXCore::Core::InternalThreadState* Th
   fpstate->mxcsr = Frame->State.mxcsr;
 
   // FCW store default
-  fpstate->fcw = Frame->State.FCW;
+  fpstate->fcw = FEXCore::FPState::ReconstructFCW(Frame->State.FCW);
   // Reconstruct FSW
   fpstate->fsw = (Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] << 11) | (Frame->State.flags[FEXCore::X86State::X87FLAG_C0_LOC] << 8) |
                  (Frame->State.flags[FEXCore::X86State::X87FLAG_C1_LOC] << 9) | (Frame->State.flags[FEXCore::X86State::X87FLAG_C2_LOC] << 10) |
@@ -748,7 +748,7 @@ uint64_t SignalDelegator::SetupRTFrame_ia32(FEXCore::Core::InternalThreadState* 
   fpstate->mxcsr = Frame->State.mxcsr;
 
   // FCW store default
-  fpstate->fcw = Frame->State.FCW;
+  fpstate->fcw = FEXCore::FPState::ReconstructFCW(Frame->State.FCW);
   // Reconstruct FSW
   fpstate->fsw = (Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] << 11) | (Frame->State.flags[FEXCore::X86State::X87FLAG_C0_LOC] << 8) |
                  (Frame->State.flags[FEXCore::X86State::X87FLAG_C1_LOC] << 9) | (Frame->State.flags[FEXCore::X86State::X87FLAG_C2_LOC] << 10) |
