@@ -824,6 +824,7 @@ void OpDispatchBuilder::X87FNSTSW(OpcodeArgs, bool DestRAX) {
 
   if (DestRAX) {
     StoreGPRRegister(X86State::REG_RAX, StatusWord, OpSize::i16Bit);
+    X87StatusNextPC = X87CompareFusion && ReducedPrecisionMode ? Op->PC + Op->InstSize : X87NoPC;
   } else {
     StoreResultGPR(Op, StatusWord);
   }
