@@ -309,6 +309,12 @@ public:
   // Should only be called at the start of IR Emission.
   void ResetWorkingList();
 
+  // The instructions after the one being dispatched in its guest block.
+  void SetFollowingInstructions(X86Tables::DecodedOp Insts, size_t Count) {
+    FollowingInsts = Insts;
+    FollowingCount = Count;
+  }
+
   void ResetDecodeFailure() {
     NeedsBlockEnd = DecodeFailure = false;
   }
@@ -754,6 +760,7 @@ public:
   void X87FLDCW(OpcodeArgs);
   void X87FNSAVE(OpcodeArgs);
   void X87FNSTENV(OpcodeArgs);
+  bool X87StateUnseenUntilBlockEnd() const;
   void X87FNSTSW(OpcodeArgs, bool DestRAX);
   void X87FRSTOR(OpcodeArgs);
   void X87FSTCW(OpcodeArgs);
@@ -1358,7 +1365,11 @@ protected:
 
 private:
   FEX_CONFIG_OPT(ReducedPrecisionMode, X87REDUCEDPRECISION);
+  FEX_CONFIG_OPT(X87CompareFusion, X87COMPAREFUSION);
   FEX_CONFIG_OPT(UndefinedFlagAcidTest, UNDEFINEDFLAGACIDTEST);
+
+  X86Tables::DecodedOp FollowingInsts {};
+  size_t FollowingCount {};
 
   struct JumpTargetInfo {
     Ref BlockEntry;
