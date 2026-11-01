@@ -46,7 +46,10 @@ static bool ProtIsWritable(ULONG Prot) {
 }
 
 bool InvalidationTracker::ProtIsEffectivelyExecutable(ULONG Prot) const {
-  return ProtHasExec(Prot) || (DEPDisabled && ProtIsReadable(Prot));
+  // A read of a guard page uses up the guard and raises its exception in the reader, so the decoder must never get there:
+  // Wine would dispatch the exception from inside the compile. Code on a guard page compiles to a block that raises the
+  // fault, which HandleFetchFault makes the guard's own exception.
+  return !(Prot & PAGE_GUARD) && (ProtHasExec(Prot) || (DEPDisabled && ProtIsReadable(Prot)));
 }
 
 void InvalidationTracker::AddExecutableInterval(FEXCore::IntervalList<uint64_t>::Interval ProtInterval, ULONG Prot) {
@@ -105,7 +108,7 @@ bool InvalidationTracker::ProtectTakesCodeAway(uint64_t Address, uint64_t Size, 
   }
 
   std::shared_lock Lock(IntervalsLock);
-  if (!(Prot & PAGE_GUARD) && ProtIsEffectivelyExecutable(Prot)) {
+  if (ProtIsEffectivelyExecutable(Prot)) {
     return false;
   }
   if (XIntervals.Intersect({AlignedBase, AlignedEnd})) {
@@ -120,7 +123,7 @@ bool InvalidationTracker::ProtectTakesCodeAway(uint64_t Address, uint64_t Size, 
     if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Base), MemoryBasicInformation, &Info, sizeof(Info), nullptr)) {
       break;
     }
-    if (Info.State == MEM_COMMIT && !(Info.Protect & PAGE_GUARD) && ProtIsEffectivelyExecutable(Info.Protect)) {
+    if (Info.State == MEM_COMMIT && ProtIsEffectivelyExecutable(Info.Protect)) {
       return true;
     }
     Base = reinterpret_cast<uint64_t>(Info.BaseAddress) + Info.RegionSize;
@@ -153,7 +156,7 @@ void InvalidationTracker::HandleProcessExecuteFlagsChange(ULONG Flags) {
 
     while (VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info))) {
       uint64_t BaseAddress = reinterpret_cast<uint64_t>(Info.BaseAddress);
-      if (Info.State == MEM_COMMIT && ProtIsReadable(Info.Protect) && !ProtHasExec(Info.Protect)) {
+      if (Info.State == MEM_COMMIT && ProtIsEffectivelyExecutable(Info.Protect) && !ProtHasExec(Info.Protect)) {
         const auto AlignedBase = BaseAddress & FEXCore::Utils::FEX_PAGE_MASK;
         const auto AlignedSize = (BaseAddress - AlignedBase + Info.RegionSize + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
         FEXCore::IntervalList<uint64_t>::Interval ProtInterval {AlignedBase, AlignedBase + AlignedSize};
@@ -248,6 +251,7 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
     std::unique_lock Lock(IntervalsLock);
     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
+    ForgetGuardedFetchPages(SectionBase, SectionBase + SectionSize);
     UnmappingSection = {SectionBase, SectionBase + SectionSize};
   }
 
@@ -282,6 +286,7 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
     std::unique_lock Lock(IntervalsLock);
     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+    ForgetGuardedFetchPages(AlignedBase, AlignedBase + AlignedSize);
   }
 
   InvalidateIntervalInternal(AlignedBase, AlignedSize, CodeLockHeld);
@@ -383,14 +388,72 @@ bool InvalidationTracker::TrackExecutableMapping(uint64_t Address) {
 
   MEMORY_BASIC_INFORMATION Info;
   if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr) ||
-      Info.State != MEM_COMMIT || (Info.Protect & PAGE_GUARD) ||
-      !(ProtHasExec(Info.Protect) || (DEPDisabled && ProtIsReadable(Info.Protect)))) {
+      Info.State != MEM_COMMIT) {
+    return false;
+  }
+
+  if (Info.Protect & PAGE_GUARD) {
+    GuardedFetchPages[Address & FEXCore::Utils::FEX_PAGE_MASK] = ++GuardedFetchGeneration;
+    return false;
+  }
+
+  if (!ProtIsEffectivelyExecutable(Info.Protect)) {
     return false;
   }
 
   const auto Base = reinterpret_cast<uint64_t>(Info.BaseAddress);
   AddExecutableInterval({Base, Base + Info.RegionSize}, Info.Protect);
   return true;
+}
+
+void InvalidationTracker::ForgetGuardedFetchPages(uint64_t Begin, uint64_t End) {
+  GuardedFetchPages.erase(GuardedFetchPages.lower_bound(Begin), GuardedFetchPages.lower_bound(End));
+}
+
+InvalidationTracker::FetchFault InvalidationTracker::HandleFetchFault(uint64_t Address, FetchRetry& LastRetry) {
+  const auto Page = Address & FEXCore::Utils::FEX_PAGE_MASK;
+
+  MEMORY_BASIC_INFORMATION Info;
+  if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Page), MemoryBasicInformation, &Info, sizeof(Info), nullptr) ||
+      Info.State != MEM_COMMIT) {
+    return FetchFault::Raise;
+  }
+
+  // The block that raised the fault goes in the notifications below. It has this page among its code pages even when it
+  // starts on the page before, as the decoder adds the page of the longest instruction it could find there.
+  if (Info.Protect & PAGE_GUARD) {
+    const ULONG Prot = Info.Protect & ~PAGE_GUARD;
+    void* TmpAddress = reinterpret_cast<void*>(Page);
+    SIZE_T TmpSize = FEXCore::Utils::FEX_PAGE_SIZE;
+    ULONG TmpProt;
+    if (!NT_SUCCESS(NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, Prot, &TmpProt))) {
+      return FetchFault::Raise;
+    }
+
+    HandleMemoryProtectionNotification(Page, FEXCore::Utils::FEX_PAGE_SIZE, Prot);
+    return FetchFault::GuardPage;
+  }
+
+  // Nothing notifies when a guard goes to a data read or to another thread's fetch, so a block that stopped at the guard
+  // can outlive it. The generation says which compile last stopped there. The instruction runs again unless this is the
+  // fault the thread last ran again, at the same generation. Then it is real, as with an instruction over the length
+  // limit on a page that once was a guard page, so a fault that comes straight back is raised, unless a compile stopped
+  // at a new guard meanwhile, which takes a guest's protect. Only the last fault is kept, so faults that take turns in a
+  // thread each run again before their raise.
+  const auto Generation = [&]() -> uint64_t {
+    std::shared_lock Lock(IntervalsLock);
+    const auto It = GuardedFetchPages.find(Page);
+    return It != GuardedFetchPages.end() && ProtIsEffectivelyExecutable(Info.Protect) ? It->second : 0;
+  }();
+
+  const FetchRetry Retry {Address, Generation};
+  if (!Generation || LastRetry == Retry) {
+    return FetchFault::Raise;
+  }
+
+  LastRetry = Retry;
+  HandleMemoryProtectionNotification(Page, FEXCore::Utils::FEX_PAGE_SIZE, Info.Protect);
+  return FetchFault::Retry;
 }
 
 FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {

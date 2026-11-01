@@ -3,6 +3,7 @@
 
 #include <FEXCore/Utils/IntervalList.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/fextl/map.h>
 #include <FEXCore/fextl/vector.h>
 #include <mutex>
 #include <shared_mutex>
@@ -63,12 +64,30 @@ public:
 
   FEXCore::HLE::ExecutableRangeInfo QueryExecutableRange(uint64_t Address);
 
+  // What to do about the execute fault of a block that couldn't decode an instruction:
+  enum class FetchFault {
+    Raise,     // Raise it as it is
+    GuardPage, // Raise the guard page's exception instead
+    Retry,     // Run the instruction again
+  };
+  // The fault a thread last ran again, see HandleFetchFault
+  struct FetchRetry {
+    uint64_t Address {};
+    uint64_t Generation {};
+    bool operator==(const FetchRetry&) const = default;
+  };
+  // Address is the first byte the instruction couldn't fetch. A guard page there has its guard used up, as the fault would
+  // have on hardware. LastRetry is per thread. Called with ThreadCreationMutex held, in a state where the hooks are not
+  // called for FEX's syscalls.
+  FetchFault HandleFetchFault(uint64_t Address, FetchRetry& LastRetry);
+
 private:
   // NOTE: These assume IntervalsLock is held: for writing, by the first two.
   void AddExecutableInterval(FEXCore::IntervalList<uint64_t>::Interval ProtInterval, ULONG Prot);
   bool TrackExecutableMapping(uint64_t Address);
   FEXCore::HLE::ExecutableRangeInfo QueryExecutableRangeLocked(uint64_t Address);
   bool ProtIsEffectivelyExecutable(ULONG Prot) const;
+  void ForgetGuardedFetchPages(uint64_t Begin, uint64_t End);
 
   void DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC);
   void DisableSMCDetection();
@@ -100,6 +119,10 @@ private:
   // asked about it meanwhile, protected by IntervalsLock
   std::pair<uint64_t, uint64_t> UnmappingSection {};
   bool UnmappingSectionMissed {false};
+  // The pages where a compile stopped at a guard, each with a number that the last such compile took from
+  // GuardedFetchGeneration, protected by IntervalsLock, see HandleFetchFault
+  fextl::map<uint64_t, uint64_t> GuardedFetchPages;
+  uint64_t GuardedFetchGeneration {};
 
   bool MonoBackpatcherDetectionPending {false};
   uint64_t MonoBase {0};
