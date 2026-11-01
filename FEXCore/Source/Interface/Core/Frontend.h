@@ -47,6 +47,8 @@ public:
     uint64_t NumInstructions {};
     FEXCore::X86Tables::DecodedInst* DecodedInstructions;
     DecodedBlockStatus BlockStatus;
+    // From the last instruction to its first byte that could not be fetched, if it hit non-executable memory
+    uint8_t FetchFaultOffset {};
     bool IsEntryPoint {};
     bool ForceFullSMCDetection {};
     fextl::vector<DataMask> DataMasks;
@@ -156,6 +158,9 @@ private:
   bool ExecutableRangeWritable {};
   bool HitNonExecutableRange {};
   bool HitBadRelocation {};
+  // Where the current instruction stopped being fetchable. Decoding carries on with zeros after a failed read, so this
+  // stays at the first one, and it is only meaningful once HitNonExecutableRange is set: a PeekByte miss doesn't count.
+  uint64_t FetchFaultAddress {};
 
   struct DecodeStream {
     // Original instruction stream RIP location.

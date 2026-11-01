@@ -5045,7 +5045,7 @@ void OpDispatchBuilder::LSLOp(OpcodeArgs) {
 }
 
 void OpDispatchBuilder::INTOp(OpcodeArgs) {
-  IR::BreakDefinition Reason;
+  IR::BreakDefinition Reason {};
   bool SetRIPToNext = false;
 
   switch (Op->OP) {
@@ -5457,12 +5457,13 @@ void OpDispatchBuilder::InvalidOp(OpcodeArgs) {
               });
 }
 
-void OpDispatchBuilder::NoExecOp(OpcodeArgs) {
+void OpDispatchBuilder::NoExecOp(OpcodeArgs, uint8_t FaultAddressOffset) {
   BreakOp(Op, FEXCore::IR::BreakDefinition {
                 .ErrorRegister = X86State::X86_PF_PROT | X86State::X86_PF_USER | X86State::X86_PF_INSTR,
                 .Signal = Core::FAULT_SIGSEGV,
                 .TrapNumber = X86State::X86_TRAPNO_PF,
                 .si_code = 2, // SEGV_ACCERR
+                .FaultAddressOffset = FaultAddressOffset,
               });
 }
 

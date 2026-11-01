@@ -1157,7 +1157,7 @@ public:
   // End of AVX 256-bit implementation
 
   void InvalidOp(OpcodeArgs);
-  void NoExecOp(OpcodeArgs);
+  void NoExecOp(OpcodeArgs, uint8_t FaultAddressOffset);
 
   void SetPackedRFLAG(bool Lower8, Ref Src);
   Ref GetPackedRFLAG(uint32_t FlagsMask = ~0U);

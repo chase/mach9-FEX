@@ -728,7 +728,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
             } else if (Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::UNIMPLEMENTED_INST) {
               Thread->OpDispatcher->UnimplementedOp(DecodedInfo);
             } else {
-              Thread->OpDispatcher->NoExecOp(DecodedInfo);
+              Thread->OpDispatcher->NoExecOp(DecodedInfo, Block.FetchFaultOffset);
             }
           }
 

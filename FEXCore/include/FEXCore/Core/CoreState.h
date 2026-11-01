@@ -432,7 +432,9 @@ struct CpuStateFrame {
     uint8_t TrapNo;
     uint8_t si_code;
     uint16_t err_code;
-    uint16_t _pad : 16;
+    // From the faulting RIP to the first byte of the instruction that could not be fetched
+    uint8_t FaultAddressOffset;
+    uint8_t _pad;
   } SynchronousFaultData;
 
   InternalThreadState* Thread;

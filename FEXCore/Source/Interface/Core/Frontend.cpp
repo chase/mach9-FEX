@@ -89,8 +89,15 @@ Decoder::Decoder(FEXCore::Core::InternalThreadState* Thread)
 }
 
 bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
+  const auto NoteFetchFault = [this](uint64_t FaultAddress) {
+    if (!HitNonExecutableRange) {
+      FetchFaultAddress = FaultAddress;
+    }
+  };
+
   // Check for wraparound
   if (Address + Size < Address) {
+    NoteFetchFault(Address);
     return false;
   }
 
@@ -101,6 +108,7 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
     ExecutableRangeWritable = RangeInfo.Writable;
 
     if (RangeInfo.Size == 0) {
+      NoteFetchFault(Address);
       return false;
     }
 
@@ -121,6 +129,10 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
 uint8_t Decoder::ReadByte() {
   std::optional<uint8_t> Byte = PeekByte(0);
   if (!Byte || InstructionSize == MAX_INST_SIZE) {
+    // The length limit is not a fetch failure, whether or not the next byte could be fetched.
+    if (InstructionSize == MAX_INST_SIZE && !HitNonExecutableRange) {
+      FetchFaultAddress = DecodeInst->PC;
+    }
     HitNonExecutableRange = true;
     // Pretend we read 0, the main decode loop will see HitNonExecutableRange and rollback the instruction.
     return 0;
@@ -1323,6 +1335,7 @@ void Decoder::AddBranchTarget(uint64_t Target) {
           .NumInstructions = BlockIt->NumInstructions - SplitIdx,
           .DecodedInstructions = BlockIt->DecodedInstructions + SplitIdx,
           .BlockStatus = BlockIt->BlockStatus,
+          .FetchFaultOffset = BlockIt->FetchFaultOffset,
         };
 
         if (BlockIt->DataMasks.size()) {
@@ -1611,6 +1624,7 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
 
       LastFieldReadSize = 0;
       BlockIt->BlockStatus = DecodeInstruction(OpAddress);
+      BlockIt->FetchFaultOffset = HitNonExecutableRange ? static_cast<uint8_t>(FetchFaultAddress - OpAddress) : 0;
       if (HitBadRelocation) {
         BlockInfo.TotalInstructionCount = 0;
         BlockInfo.Blocks = {*BlockIt};
