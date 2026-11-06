@@ -67,12 +67,26 @@ public:
 
   Decoder(FEXCore::Core::InternalThreadState* Thread);
   bool CheckIfCacheable(FEXCore::Core::InternalThreadState&, const uint8_t* InstStream, uint64_t PC, uint64_t MaxInst);
-
-  void SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst);
+  // TrapWritesBeforeRead arms the SMC write trap on a writable executable page when
+  // the decoder first asks to read from it (see CheckRangeExecutable). Decodes that
+  // run under the code invalidation mutex (CompileBlock) ask for it; a decode racing
+  // guest writes without that mutex must not take traps, and offline decodes never do.
+  void SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst,
+                                      bool TrapWritesBeforeRead = false);
   void DecodeLoop(const uint8_t* InstStream, uint64_t GuestPause = 0);
 
   const DecodedBlockInformation* GetDecodedBlockInfo() const {
     return &BlockInfo;
+  }
+
+  // Valid only for the current decode, while its code-invalidation lock is held.
+  bool DidTrapWrites(uint64_t Page) const {
+    for (auto TrappedPage : WriteTrappedPages) {
+      if (TrappedPage == Page) {
+        return true;
+      }
+    }
+    return false;
   }
 
   uint64_t DecodedMinAddress {};
@@ -156,6 +170,13 @@ private:
   uint64_t ExecutableRangeBase {};
   uint64_t ExecutableRangeEnd {};
   bool ExecutableRangeWritable {};
+  // Set from SetupDecodeInstructionsAtEntry's parameter: while armed, the first read
+  // from a page of a writable executable range takes the SMC write trap on it first.
+  bool TrapWritesBeforeRead {};
+  // The last page CheckRangeExecutable trapped during this decode, ~0 if none.
+  uint64_t TrapPageHint = ~0ULL;
+  // Reuse capacity across decodes, but never retain trap state across lock scopes.
+  fextl::vector<uint64_t> WriteTrappedPages;
   bool HitNonExecutableRange {};
   bool HitBadRelocation {};
   // Where the current instruction stopped being fetchable. Decoding carries on with zeros after a failed read, so this

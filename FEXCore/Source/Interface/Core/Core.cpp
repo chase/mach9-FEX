@@ -9,6 +9,9 @@ $end_info$
 */
 
 #include <cstdint>
+#include <cerrno>
+#include <cstdlib>
+#include <string>
 #ifdef ZYDIS_DISASSEMBLER
 #include <Zydis/Zydis.h>
 #endif
@@ -855,6 +858,166 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   };
 }
 
+// Opt-in protection-order probe (mach9#54). File payloads are little-endian
+// uint64_t fields, independent of the guest's pointer width:
+//   want.<pid>: GuestRIP, modified byte address, sequence
+//   ready.<pid>: the request, opcode protection, modified-byte protection,
+//                probe duration in ns, code-lock duration in ns
+// The constructor reads before the code lock is taken. Capture only queries
+// native page protections before publication; it never waits for the test.
+// Declare the probe before the lock guard so its destructor writes the result
+// after the guard releases the lock. Query failures report protection zero.
+// ready.<pid>.error records request fields, failure stage, and OS error. Stages:
+// 1=no capture, 2=request changed/unreadable, 3=request deletion, 4=result open,
+// 5=result write. All request handles share deletion with the reporting thread.
+class SMCTestProbe final {
+public:
+  explicit SMCTestProbe(uint64_t GuestRIP) {
+    static const char* const Dir = getenv("FEX_SMC_TEST_GATE");
+    if (!Dir || !*Dir) {
+      return;
+    }
+
+    const std::string Suffix = "." + std::to_string(getpid());
+    std::string Want = std::string(Dir) + "/want" + Suffix;
+    uint64_t Request[3] {};
+    if (!Read(Want, Request, sizeof(Request)) || Request[0] != GuestRIP || !Request[2]) {
+      return;
+    }
+    State = fextl::make_unique<ProbeState>();
+    State->Want = std::move(Want);
+    State->Ready = std::string(Dir) + "/ready" + Suffix;
+    std::copy(Request, Request + 3, State->Record.begin());
+  }
+
+  ~SMCTestProbe() {
+    if (!State) {
+      return;
+    }
+    auto& Probe = *State;
+    if (!Probe.Captured) {
+      ReportFailure(1, 0);
+      return;
+    }
+
+    // This timestamp is taken after the code-lock guard has been destroyed,
+    // before file I/O. It includes compilation, the probe, and lock release.
+    Probe.Record[6] = Nanoseconds(Clock::now() - Probe.LockStart);
+    uint64_t Request[3] {};
+    uint64_t ReadError {};
+    if (!Read(Probe.Want, Request, sizeof(Request), &ReadError)) {
+      ReportFailure(2, ReadError);
+      return;
+    }
+    if (!std::equal(Request, Request + 3, Probe.Record.begin())) {
+      ReportFailure(2, 0);
+      return;
+    }
+#ifdef _WIN32
+    if (!DeleteFileA(Probe.Want.c_str())) {
+#else
+    if (remove(Probe.Want.c_str()) != 0) {
+#endif
+      ReportFailure(3, SystemError());
+      return;
+    }
+    FEXCore::File::File Result {Probe.Ready.c_str(), FEXCore::File::FileModes::WRITE | FEXCore::File::FileModes::CREATE |
+                                                   FEXCore::File::FileModes::TRUNCATE};
+    if (!Result.IsValid()) {
+      ReportFailure(4, SystemError());
+      return;
+    }
+    const size_t Bytes = sizeof(Probe.Record);
+    const auto Written = Result.Write(Probe.Record.data(), Bytes);
+    if (Written != static_cast<ssize_t>(Bytes)) {
+      ReportFailure(5, Written < 0 ? SystemError() : 0);
+    }
+  }
+
+  SMCTestProbe(const SMCTestProbe&) = delete;
+  SMCTestProbe& operator=(const SMCTestProbe&) = delete;
+
+  void LockAcquired() {
+    if (State) {
+      State->LockStart = Clock::now();
+    }
+  }
+
+  void Capture(uint64_t StartAddr, uint64_t Length) {
+    if (!State || State->Record[1] < StartAddr || State->Record[1] - StartAddr >= Length) {
+      return;
+    }
+    auto& Probe = *State;
+
+    const auto Start = Clock::now();
+#ifdef _WIN32
+    const auto Protection = [](uint64_t Address) -> uint64_t {
+      MEMORY_BASIC_INFORMATION Info {};
+      if (VirtualQuery(reinterpret_cast<const void*>(Address), &Info, sizeof(Info)) != sizeof(Info) || Info.State != MEM_COMMIT) {
+        return 0;
+      }
+      return Info.Protect;
+    };
+    Probe.Record[3] = Protection(Probe.Record[0]);
+    Probe.Record[4] = Protection(Probe.Record[1]);
+#endif
+    Probe.Record[5] = Nanoseconds(Clock::now() - Start);
+    Probe.Captured = true;
+  }
+
+private:
+  using Clock = std::chrono::steady_clock;
+
+  static uint64_t Nanoseconds(Clock::duration Duration) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(Duration).count();
+  }
+
+  static bool Read(const std::string& Path, void* Data, size_t Size, uint64_t* Error = nullptr) {
+    // The CRT's fopen only shares reads. A concurrent constructor must not block
+    // the reporting thread from consuming the request after its lock is released.
+    FEXCore::File::File Input {Path.c_str(), FEXCore::File::FileModes::READ};
+    if (!Input.IsValid()) {
+      if (Error) {
+        *Error = SystemError();
+      }
+      return false;
+    }
+    const auto Bytes = Input.Read(Data, Size);
+    if (Error) {
+      *Error = Bytes < 0 ? SystemError() : 0;
+    }
+    return Bytes == static_cast<ssize_t>(Size);
+  }
+
+  static uint64_t SystemError() {
+#ifdef _WIN32
+    return GetLastError();
+#else
+    return errno;
+#endif
+  }
+
+  void ReportFailure(uint64_t Stage, uint64_t Error) const {
+    const auto& Probe = *State;
+    const std::array<uint64_t, 5> Record {Probe.Record[0], Probe.Record[1], Probe.Record[2], Stage, Error};
+    FEXCore::File::File Output {(Probe.Ready + ".error").c_str(), FEXCore::File::FileModes::WRITE |
+                                                                FEXCore::File::FileModes::CREATE |
+                                                                FEXCore::File::FileModes::TRUNCATE};
+    if (Output.IsValid()) {
+      Output.Write(Record.data(), sizeof(Record));
+    }
+  }
+
+  struct ProbeState {
+    std::string Want;
+    std::string Ready;
+    std::array<uint64_t, 7> Record {};
+    Clock::time_point LockStart {};
+    bool Captured {};
+  };
+  fextl::unique_ptr<ProbeState> State;
+};
+
 uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
   if constexpr (BLOCK_DEBUGGING) {
     // Block debugging logic is hand-written and needs to be handled with care.
@@ -873,16 +1036,30 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
 
-  // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
-  auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
+  // An L1 miss can still find cached code here. Keep probe construction and
+  // request I/O off this path, including when the probe is disabled.
+  {
+    auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
+    if (auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
+      return HostCode;
+    }
+  }
 
-  // Is the code in the cache?
-  // The backends only check L1 and L2, not L3
+  // Request I/O must run outside the invalidation lock. Declare the probe first
+  // so its result is also written only after the lock guard has been destroyed.
+  SMCTestProbe Probe {GuestRIP};
+  auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
+  Probe.LockAcquired();
+
+  // Another thread may have published or invalidated code while we were unlocked.
+  // Do not reuse the earlier miss or read guest bytes until the lock is held again.
   if (auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
     return HostCode;
   }
 
-  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
+  // Armed: this decode holds the code invalidation mutex, so it must take the SMC
+  // write trap on every writable executable page before reading it (mach9#54).
+  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst, /*TrapWritesBeforeRead=*/true);
 
   std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
   std::optional<DiskCache::CodeHitData> Hit;
@@ -981,6 +1158,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
+  // Capture page protections before publication without waiting for the test.
+  Probe.Capture(StartAddr, Length);
+
   fextl::vector<uint64_t> CodePages;
 
   if (NeedsAddGuestCodeRanges) {
@@ -991,7 +1171,13 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     CodePages.insert(CodePages.end(), BlockInfo->CodePages.begin(), BlockInfo->CodePages.end());
     for (auto CodePage : BlockInfo->CodePages) {
       if (Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE)) {
-        SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+        // The shared invalidation lock has remained held since decoding. A page
+        // protected before its read needs no second protection syscall here.
+        // Keep the late trap for other pages, including read-only code with
+        // writable aliases and pages recorded for a failed instruction fetch.
+        if (!Thread->FrontendDecoder->DidTrapWrites(CodePage)) {
+          SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
+        }
       }
     }
   }
@@ -1039,7 +1225,7 @@ uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, ui
   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
   auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
 
-  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, 1);
+  Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, 1, /*TrapWritesBeforeRead=*/true);
   auto [CompiledCode, DebugData, StartAddr, Length, _] = CompileCode(Thread, GuestRIP, 1);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {

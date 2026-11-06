@@ -32,6 +32,13 @@ public:
 
   virtual void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) = 0;
 
+  // Take the SMC write trap on the guest-writable part of [Start, Start + Length):
+  // stores to it must fault from here on, so a store racing a compile that reads the
+  // range cannot be lost (mach9#54). Called from CompileBlock's decoder before the
+  // first read of a page and again after a block is built, always with the code
+  // invalidation mutex held shared; it must be idempotent, must leave pages the guest
+  // made non-writable alone, and must tolerate ranges that hold no code, since a
+  // compile that traps a page can still fail.
   virtual void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
   virtual void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {}
   virtual void MarkOvercommitRange(uint64_t Start, uint64_t Length) {}

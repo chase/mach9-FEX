@@ -101,28 +101,43 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
     return false;
   }
 
-  while (Address < ExecutableRangeBase || Address + Size > ExecutableRangeEnd) {
-    auto RangeInfo = CTX->SyscallHandler->QueryGuestExecutableRange(Thread, Address);
-    ExecutableRangeBase = RangeInfo.Base;
-    ExecutableRangeEnd = RangeInfo.Base + RangeInfo.Size;
-    ExecutableRangeWritable = RangeInfo.Writable;
+  while (Size) {
+    if (Address < ExecutableRangeBase || Address >= ExecutableRangeEnd) {
+      auto RangeInfo = CTX->SyscallHandler->QueryGuestExecutableRange(Thread, Address);
+      ExecutableRangeBase = RangeInfo.Base;
+      ExecutableRangeEnd = RangeInfo.Base + RangeInfo.Size;
+      ExecutableRangeWritable = RangeInfo.Writable;
 
-    if (RangeInfo.Size == 0) {
-      NoteFetchFault(Address);
-      return false;
+      if (RangeInfo.Size == 0) {
+        NoteFetchFault(Address);
+        return false;
+      }
     }
 
-    // An instruction can start in one range and end in the next
-    BlockInfo.InWritableRange |= RangeInfo.Writable;
-
-    uint64_t RangeRemainingSize = ExecutableRangeEnd - Address;
-    if (Size > RangeRemainingSize) {
-      Size -= RangeRemainingSize;
-      Address += RangeRemainingSize;
+    // Validate and trap one interval at a time: the following interval may not be
+    // executable. A cache hit validates permissions, not the write trap: an
+    // interval can span untrapped pages, or have been cached by an unarmed decode.
+    const uint64_t ReadSize = std::min(Size, ExecutableRangeEnd - Address);
+    if (TrapWritesBeforeRead && ExecutableRangeWritable) {
+      const uint64_t LastPage = (Address + ReadSize - 1) & FEXCore::Utils::FEX_PAGE_MASK;
+      for (uint64_t Page = Address & FEXCore::Utils::FEX_PAGE_MASK;; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+        if (Page != TrapPageHint) {
+          if (!DidTrapWrites(Page)) {
+            CTX->SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_PAGE_SIZE);
+            WriteTrappedPages.push_back(Page);
+          }
+          TrapPageHint = Page;
+        }
+        if (Page == LastPage) {
+          break;
+        }
+      }
     }
+
+    BlockInfo.InWritableRange |= ExecutableRangeWritable;
+    Size -= ReadSize;
+    Address += ReadSize;
   }
-
-  BlockInfo.InWritableRange |= ExecutableRangeWritable;
   return true;
 }
 
@@ -1756,7 +1771,8 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
   }
 }
 
-void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst) {
+void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst,
+                                              bool TrapWritesBeforeRead) {
   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
   BlockInfo.TotalInstructionCount = 0;
   BlockInfo.Blocks.clear();
@@ -1769,6 +1785,9 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
     MaxInst = CTX->Config.MaxInstPerBlock;
   }
   this->MaxInst = MaxInst;
+  this->TrapWritesBeforeRead = TrapWritesBeforeRead;
+  TrapPageHint = ~0ULL;
+  WriteTrappedPages.clear();
   MaxCondBranchForward = 0;
   MaxCondBranchBackwards = ~0ULL;
   DecodedBuffer = PoolObject.ReownOrClaimBuffer();
