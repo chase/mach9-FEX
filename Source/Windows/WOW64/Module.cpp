@@ -96,8 +96,16 @@ struct TLS {
     return reinterpret_cast<CONTEXT*&>(TEB->TlsSlots[FEXCore::ToUnderlying(Slot::ENTRY_CONTEXT)]);
   }
 
-  FEXCore::Core::InternalThreadState*& ThreadState() const {
-    return reinterpret_cast<FEXCore::Core::InternalThreadState*&>(TEB->TlsSlots[FEXCore::ToUnderlying(Slot::THREAD_STATE)]);
+  FEXCore::Core::InternalThreadState* ThreadState() const {
+    // Native exceptions can arrive before thread initialization or after teardown,
+    // when there is no CPU area. Keep those reads safe for exception dispatch.
+    const auto* Area = CpuArea();
+    return Area ? static_cast<FEXCore::Core::InternalThreadState*>(Area->EmulatorData[1]) : nullptr;
+  }
+
+  void SetThreadState(FEXCore::Core::InternalThreadState* Thread) const {
+    // Initialization always installs a CPU area before publishing the state.
+    CpuArea()->EmulatorData[1] = Thread;
   }
 
   // This is used to work around user callback handling (see Wow64KiUserCallbackDispatcher in wine) unbalancing the
@@ -323,7 +331,32 @@ private:
 // for good, and orders nothing, as the other process makes its syscall without waiting for this one. So for queued
 // items the first notification does nothing, and the second one takes the mutex only for its own work.
 void ProcessCrossProcessWork() {
-  auto* Data = GetFrontendThreadData(GetTLS().ThreadState());
+  // Null until BTCpuThreadInit has set the thread's frontend data up and after
+  // BTCpuThreadTerm has torn it down (see GetCurrentFrontendThreadData). A compile
+  // racing teardown must not touch it; the queue gets drained by another thread's
+  // syscall or compile (mach9#54).
+  const auto TLSv = GetTLS();
+  auto* Area = TLSv.CpuArea();
+  auto* Thread = Area ? TLSv.ThreadState() : nullptr;
+  // The area's ThreadState may name a thread that has already been torn down: on wow64 a
+  // re-initialized thread leaves the old pointer in the area after its state was destroyed
+  // (mach9#54). Only a thread still in the registry is safe to touch - term erases from it
+  // before destroying anything, so this rejects null, terminated and mid-destruction states.
+  bool Live = false;
+  if (Thread) {
+    // The map's contract requires ThreadCreationMutex on every access (see its
+    // declaration): a bare find races a concurrent BTCpuThreadInit's emplace, whose
+    // rehash can fault the traversal - observed as a nondeterministic v2 crash on
+    // wow64 (mach9#54). Brief scope: never held across the drain below, whose
+    // callbacks take this mutex themselves.
+    std::scoped_lock Lock(ThreadCreationMutex);
+    auto It = Threads.find(GetCurrentThreadId());
+    Live = It != Threads.end() && It->second == Thread;
+  }
+  auto* Data = Live ? GetFrontendThreadData(Thread) : nullptr;
+  if (!Data) {
+    return;
+  }
   const bool Prev = Data->InCrossProcessWork;
   Data->InCrossProcessWork = true;
   Wow64ProcessPendingCrossProcessItems();
@@ -780,6 +813,17 @@ public:
 };
 
 void BTCpuProcessInit() {
+  // FEX keeps EntryContext/ControlWord/CachedCallRetSp in TEB TlsSlots 18/17/15 (ThreadState
+  // now lives in the CPU area instead). Reserve them so TlsAlloc can never hand these bits
+  // out to wine or the guest: a guest TlsSetValue on such a slot clobbers FEX's per-thread
+  // state (mach9#54). Null-safe: wine's loader may not have installed the bitmap yet.
+  if (auto* Peb = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb; Peb && Peb->TlsBitmap) {
+    RtlAcquirePebLock();
+    // Bits 15-18 of word 0; setting them directly is safe even before RtlInitializeBitMap
+    // runs (it only writes the descriptor, never the bits).
+    Peb->TlsBitmapBits[0] |= 0xFu << 15;
+    RtlReleasePebLock();
+  }
   FEX::Windows::InitCRTProcess();
   FEX::Windows::SetupThreadHandlers();
   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
@@ -984,12 +1028,21 @@ static void InitThreadLocked() {
   FEX::Windows::HardwareTSO::InitThread(Frame);
 
   const auto TLS = GetTLS();
-  TLS.ThreadState() = Thread;
+  TLS.SetThreadState(Thread);
 
   Thread->FrontendPtr = new FrontendThreadData(TLS);
+  // The write above landed in the stack InitCpuArea (the ctor below still reads it); with
+  // ThreadState living in the CPU area, publish it again now that the ctor switched
+  // TLS.CpuArea() to the heap FrontendThreadData everyone else reads.
+  TLS.SetThreadState(Thread);
 
   auto ThreadTID = GetCurrentThreadId();
-  Threads.emplace(ThreadTID, Thread);
+  // insert_or_assign: a second BTCpuThreadInit on this thread (wine re-entry) must update
+  // the registry to the current ThreadState - emplace's no-overwrite left a stale entry,
+  // which made ProcessCrossProcessWork's liveness guard reject the live thread and skip
+  // the cross-process drain, dying at the first guest syscall (mach9#54). Term's erase
+  // remains the liveness authority.
+  Threads.insert_or_assign(ThreadTID, Thread);
   if (StatAllocHandler) {
     Thread->ThreadStats = StatAllocHandler->AllocateSlot(ThreadTID);
   }
@@ -1081,6 +1134,9 @@ void BTCpuThreadTerm(HANDLE Thread, LONG ExitCode) {
         return;
       }
       CpuArea.SuspendDoorbell = &Doorbell;
+      // Carry the thread state into the switch area: with ThreadState stored in the CPU area
+      // (EmulatorData[1]), the term path's reads must survive the switch (mach9#54).
+      CpuArea.EmulatorData[1] = Own->EmulatorData[1];
       std::atomic_signal_fence(std::memory_order_seq_cst);
       TLS.CpuArea() = &CpuArea;
       std::atomic_signal_fence(std::memory_order_seq_cst);
@@ -1126,6 +1182,10 @@ void BTCpuThreadTerm(HANDLE Thread, LONG ExitCode) {
     }
     AreaSwitch.TornDown = true;
     delete GetFrontendThreadData(ThreadState);
+    // FrontendPtr must not outlive its data: GetCurrentFrontendThreadData documents it as null
+    // after BTCpuThreadTerm, and a compile racing teardown would otherwise touch freed memory
+    // (mach9#54).
+    ThreadState->FrontendPtr = nullptr;
 
     // GDT and LDT are mirrored, only free one.
     delete[] ThreadState->CurrentFrame->State.segment_arrays[FEXCore::Core::CPUState::SEGMENT_ARRAY_INDEX_GDT];
